@@ -9,6 +9,7 @@ function App() {
   const [authMode, setAuthMode] = useState("LOGIN");
   const [user, setUser] = useState({ userId: "", nickname: "", password: "" });
   const [token, setToken] = useState("");
+  const [joinInfo, setJoinInfo] = useState({ code: "", password: "" });
   
   const [roomInfo, setRoomInfo] = useState({ 
     id: "", 
@@ -39,7 +40,8 @@ function App() {
     const response = await fetch(`${API_BASE}${path}`, {
       headers: {
         'Content-Type': 'application/json',
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(options.authToken ? { Authorization: `Bearer ${options.authToken}` } : {}),
+        ...(!options.authToken && token ? { Authorization: `Bearer ${token}` } : {}),
         ...(options.headers || {})
       },
       ...options
@@ -114,7 +116,7 @@ function App() {
           const result = await uploadAudio(roomInfo.id, audioBlob);
           addMessage({
             id: result.message_id || `${Date.now()}`,
-            sender: user.userId,
+            senderName: user.userId,
             time: formatTime(new Date().toISOString()),
             text: result.text || ''
           });
@@ -161,6 +163,11 @@ function App() {
     return new Date(isoString).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' });
   };
 
+  const formatRoomCode = (roomId) => {
+    if (!roomId) return '';
+    return roomId.replace(/-/g, '').slice(0, 6).toUpperCase();
+  };
+
   const getSenderName = (senderUserId) => {
     if (!senderUserId) return 'Unknown';
     const matched = participants.find(p => p.userId === senderUserId);
@@ -177,7 +184,8 @@ function App() {
     const history = await fetchJson(`/rooms/${roomId}/messages?limit=100&offset=0`);
     const mapped = history.map(m => ({
       id: m.id,
-      sender: getSenderName(m.sender_user_id),
+      senderUserId: m.sender_user_id,
+      senderEmail: m.sender_email,
       time: formatTime(m.created_at),
       text: m.content_text
     }));
@@ -195,6 +203,8 @@ function App() {
 
       setToken(result.access_token);
       setUser(prev => ({ ...prev, userId: result.user.email }));
+      localStorage.setItem('auth_token', result.access_token);
+      localStorage.setItem('auth_email', result.user.email);
       setView("LOBBY");
     } catch (error) {
       alert(error.message || '로그인 실패');
@@ -237,10 +247,9 @@ function App() {
   };
 
   const handleJoinRoom = async () => {
-    const code = prompt("입장할 방 코드를 입력하세요.");
-    if (!code) return;
-    const pass = prompt("방 비밀번호를 입력하세요.");
-    if (pass === null) return;
+    const code = joinInfo.code.trim();
+    if (!code) return alert("방 코드를 입력하세요.");
+    const pass = joinInfo.password;
 
     try {
       await fetchJson(`/rooms/${code}/join`, {
@@ -260,6 +269,7 @@ function App() {
       await loadParticipants(info.id);
       await loadMessages(info.id);
       setCurrentSpeaker(null);
+      setJoinInfo({ code: "", password: "" });
       setView("ROOM");
     } catch (error) {
       alert(error.message || '방 참여 실패');
@@ -280,6 +290,26 @@ function App() {
     setRoomInfo({ id: "", title: "", password: "", maxParticipants: 2 });
     setView("LOBBY");
   };
+
+  useEffect(() => {
+    const savedToken = localStorage.getItem('auth_token');
+    const savedEmail = localStorage.getItem('auth_email');
+    if (!savedToken || !savedEmail) return;
+
+    const validateSession = async () => {
+      try {
+        const me = await fetchJson('/auth/me', { authToken: savedToken });
+        setToken(savedToken);
+        setUser(prev => ({ ...prev, userId: me.email || savedEmail }));
+        setView("LOBBY");
+      } catch {
+        localStorage.removeItem('auth_token');
+        localStorage.removeItem('auth_email');
+      }
+    };
+
+    validateSession();
+  }, []);
 
   const startSpeakerHeartbeat = async (roomId) => {
     if (speakerHeartbeatRef.current) return;
@@ -346,7 +376,8 @@ function App() {
           const messagePayload = payload.payload || {};
           addMessage({
             id: messagePayload.message_id || `${Date.now()}`,
-            sender: getSenderName(messagePayload.sender_user_id),
+            senderUserId: messagePayload.sender_user_id,
+            senderEmail: messagePayload.sender_email,
             time: formatTime(messagePayload.created_at || payload.ts),
             text: messagePayload.text
           });
@@ -368,7 +399,19 @@ function App() {
     return () => {
       socket.close();
     };
-  }, [view, roomInfo.id, token, participants]);
+  }, [view, roomInfo.id, token]);
+
+  useEffect(() => {
+    if (view !== 'ROOM' || !roomInfo.id) return;
+
+    const intervalId = setInterval(() => {
+      loadParticipants(roomInfo.id).catch(() => {});
+    }, 5000);
+
+    return () => {
+      clearInterval(intervalId);
+    };
+  }, [view, roomInfo.id]);
 
   useEffect(() => {
     return () => {
@@ -412,7 +455,7 @@ function App() {
             <div style={{ fontSize: '40px', marginBottom: '15px' }}>➕</div>
             <h3>방 만들기</h3>
           </div>
-          <div onClick={handleJoinRoom} style={{ ...cardStyle, width: '220px', cursor: 'pointer' }}>
+          <div onClick={() => setView("JOIN_ROOM")} style={{ ...cardStyle, width: '220px', cursor: 'pointer' }}>
             <div style={{ fontSize: '40px', marginBottom: '15px' }}>🔑</div>
             <h3>방 참여하기</h3>
           </div>
@@ -421,7 +464,33 @@ function App() {
     );
   }
 
-  // 3. 방 생성 상세 설정 페이지 (추가된 부분)
+  // 3. 방 참여 페이지
+  if (view === "JOIN_ROOM") {
+    return (
+      <div style={{ display: 'flex', height: '100vh', alignItems: 'center', justifyContent: 'center', background: '#f3f4f6' }}>
+        <div style={cardStyle}>
+          <h3 style={{ marginBottom: '25px' }}>방 참여하기</h3>
+          <input
+            style={inputStyle}
+            placeholder="방 코드 (예: ABCDEF)"
+            value={joinInfo.code}
+            onChange={e => setJoinInfo(prev => ({ ...prev, code: e.target.value }))}
+          />
+          <input
+            style={inputStyle}
+            type="password"
+            placeholder="방 비밀번호"
+            value={joinInfo.password}
+            onChange={e => setJoinInfo(prev => ({ ...prev, password: e.target.value }))}
+          />
+          <button style={{ ...primaryBtn, width: '100%' }} onClick={handleJoinRoom}>입장하기</button>
+          <button style={{ background: 'none', border: 'none', color: '#999', marginTop: '15px', cursor: 'pointer' }} onClick={() => setView("LOBBY")}>취소</button>
+        </div>
+      </div>
+    );
+  }
+
+  // 4. 방 생성 상세 설정 페이지 (추가된 부분)
   if (view === "CREATE_ROOM") {
     return (
       <div style={{ display: 'flex', height: '100vh', alignItems: 'center', justifyContent: 'center', background: '#f3f4f6' }}>
@@ -440,7 +509,7 @@ function App() {
     );
   }
 
-  // 4. 메인 미팅룸 (헤더에 제목 반영)
+  // 5. 메인 미팅룸 (헤더에 제목 반영)
   return (
     <div style={{ display: 'flex', height: '100vh', backgroundColor: '#f9fafb', fontFamily: 'sans-serif' }}>
       <aside style={{ width: '240px', background: '#fff', borderRight: '1px solid #e5e7eb', padding: '20px' }}>
@@ -455,7 +524,7 @@ function App() {
 
       <main style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
         <div style={{ height: '60px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 25px', background: '#fff', borderBottom: '1px solid #e5e7eb' }}>
-          <div style={{ color: '#4f46e5', fontWeight: 'bold', fontSize: '13px' }}>#{roomInfo.id}</div>
+          <div style={{ color: '#4f46e5', fontWeight: 'bold', fontSize: '13px' }}>#{formatRoomCode(roomInfo.id)}</div>
           <div style={{ fontSize: '16px', fontWeight: 'bold', color: '#111827' }}>{roomInfo.title}</div>
           <button onClick={handleLeaveRoom} style={{ color: '#ef4444', border: 'none', background: 'none', fontWeight: 'bold', cursor: 'pointer' }}>나가기</button>
         </div>
@@ -466,15 +535,33 @@ function App() {
         </div>
 
         <div ref={scrollRef} style={{ flex: 1, padding: '10px 40px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '20px' }}>
-          {messages.map((m, i) => (
-            <div key={i} style={{ background: '#fff', padding: '16px 20px', borderRadius: '16px', border: '1px solid #e5e7eb', maxWidth: '90%', alignSelf: 'flex-start', boxShadow: '0 2px 4px rgba(0,0,0,0.02)' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '10px' }}>
-                <span style={{ fontWeight: 'bold', color: '#4f46e5', fontSize: '12px' }}>{m.sender}</span>
-                <span style={{ fontSize: '10px', color: '#9ca3af' }}>{m.time}</span>
+          {messages.map((m, i) => {
+            const senderLabel = m.senderEmail || (m.senderUserId ? getSenderName(m.senderUserId) : (m.senderName || 'Unknown'));
+            const isMine = (m.senderEmail && m.senderEmail === user.userId)
+              || (m.senderUserId && m.senderUserId === user.userId)
+              || (m.senderName && m.senderName === user.userId);
+
+            return (
+              <div
+                key={i}
+                style={{
+                  background: '#fff',
+                  padding: '16px 20px',
+                  borderRadius: '16px',
+                  border: '1px solid #e5e7eb',
+                  maxWidth: '90%',
+                  alignSelf: isMine ? 'flex-end' : 'flex-start',
+                  boxShadow: '0 2px 4px rgba(0,0,0,0.02)'
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '10px' }}>
+                  <span style={{ fontWeight: 'bold', color: '#4f46e5', fontSize: '12px' }}>{senderLabel}</span>
+                  <span style={{ fontSize: '10px', color: '#9ca3af' }}>{m.time}</span>
+                </div>
+                <p style={{ margin: 0, fontSize: '15px', lineHeight: '1.6', color: '#374151' }}>{m.text}</p>
               </div>
-              <p style={{ margin: 0, fontSize: '15px', lineHeight: '1.6', color: '#374151' }}>{m.text}</p>
-            </div>
-          ))}
+            );
+          })}
         </div>
 
         <footer style={{ padding: '20px', background: '#fff', borderTop: '1px solid #e5e7eb', textAlign: 'center' }}>
